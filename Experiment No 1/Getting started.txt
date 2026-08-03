@@ -1,0 +1,6 @@
+1) Read the problem statement.
+
+2) Setup the motor driver circuit (L298N) on the breadboard and interface it with the arduino and 
+	interface the encoder of Tilt Axis rotor to arduino using companion board.
+
+3) Once the connections are made, make sure they are verified by the TAs before switching ON the power supply. 
