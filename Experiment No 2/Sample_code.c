@@ -1,4 +1,4 @@
-// -O0
+/ -O0
 // 7372800Hz
 
 #include <avr/io.h>
@@ -12,6 +12,8 @@ unsigned char l = 0;
 unsigned char c = 0;
 unsigned char r = 0;
 unsigned char PortBRestore = 0;
+
+
 
 void motion_pin_config (void)
 {
@@ -159,23 +161,79 @@ unsigned char ADC_Conversion(unsigned char Ch)
 //Main Function
 int main(void)
 {
+	int prev = 0;
  init_devices();
 
  lcd_set_4bit();
  lcd_init();
-/*
+
 while(1)
 {
 	l=ADC_Conversion(3);
-	c=ADC_Conversion(4);
+	c=3*ADC_Conversion(4);
 	r=ADC_Conversion(5);
 	lcd_print(1, 1, l, 3);
 	lcd_print(1, 5, c, 3);
 	lcd_print(1, 9, r, 3);
+	lcd_print(1, 13, prev, 3);
 	_delay_ms(300);
+	
+	if(l>c && l>20){
+		if(c<20){
+			hard_stop();
+			soft_left();
+			_delay_ms(25);
+			l=ADC_Conversion(3);
+			c=3*ADC_Conversion(4);
+			r=ADC_Conversion(5);
+		}
+	}
+	else if(r>c && r>20){
+		if(c<20){
+			hard_stop();
+			soft_right();
+			_delay_ms(25);
+			l=ADC_Conversion(3);
+			c=3*ADC_Conversion(4);
+			r=ADC_Conversion(5);
+		}
+	}
+	else if(c > r && c > l && c>20){
+		forward();
+		prev=3;
+		_delay_ms(25);
+	}
+	else{
+		if(prev == 3 ||prev== 4){
+			if(c > r && c > l && c>15){
+				back();
+				_delay_ms(500);
+				prev = 4;
+			}
+		}
+		else{
+			if(prev==1){
+				right();
+				_delay_ms(50);
+				back();
+				_delay_ms(50);
+				prev=0;
+			}
+			else if(prev==2){
+				left();
+				_delay_ms(50);
+				back();
+				_delay_ms(50);
+				prev=0;
+			}
+			else{
+				soft_stop();
+			}
+		}
+	}
 }
 
-*/
+/*
 while(1)
 {
 	forward();            //both wheels forward
@@ -226,5 +284,6 @@ while(1)
 	hard_stop();						
 	_delay_ms(300);
 }
+*/
 
 }
