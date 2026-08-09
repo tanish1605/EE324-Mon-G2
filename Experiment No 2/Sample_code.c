@@ -1,124 +1,112 @@
-/ -O0
+// -O0
 // 7372800Hz
+//
+// PID line follower — see README.md for the full write-up of the design.
+//
+// NOTE: hand-written, not compiled — no AVR toolchain available in this
+// environment. Check register/pin names against your exact board before
+// flashing.
 
 #include <avr/io.h>
 #include <avr/interrupt.h>
 #include <util/delay.h>
+#include <math.h>
 #include "lcd.c"
 
 unsigned char ADC_Conversion(unsigned char);
-unsigned char ADC_Value;
 unsigned char l = 0;
 unsigned char c = 0;
 unsigned char r = 0;
 unsigned char PortBRestore = 0;
 
+// ---- Per-sensor calibration ------------------------------------------
+// TODO: measure each sensor's raw ADC reading fully OFF the line (MIN)
+// and fully ON the line (MAX), then fill these in. See README.md ->
+// "Calibration" for how to take the measurements. Left at 0/255 (a
+// no-op) so the code behaves like uncalibrated raw values until you do.
+unsigned char L_MIN = 0,   L_MAX = 255;
+unsigned char C_MIN = 0,   C_MAX = 255;
+unsigned char R_MIN = 0,   R_MAX = 255;
 
+// ---- Tunable PID / behavior constants ---------------------------------
+// error/position is on a normalized -255..+255 scale (see compute_position),
+// so these are a reasonable starting point but still need retuning on the
+// actual bot, especially after you plug in real calibration values.
+#define KP              0.9f
+#define KI              0.0005f
+#define KD              6.0f      // acts on a *filtered* delta, so can run higher than a raw-derivative gain without going noisy
+#define D_FILTER_ALPHA  0.5f      // 0..1, higher = trust the newest sample more (less smoothing)
+
+#define BASE_SPEED      150
+#define MAX_SPEED       255
+#define MIN_SPEED       60
+#define PIVOT_SPEED     140       // wheel speed used during a hard pivot turn
+#define LINE_THRESH     20        // applied to NORMALIZED sensor values
+#define RECOVERY_SPEED  100
+#define SHARP_TURN_ERR  180.0f    // |error| beyond this -> pivot instead of differential steer
+
+float error = 0, prev_error = 0, integral = 0;
+float derivative = 0, filtered_derivative = 0, pid_output = 0;
+
+// ---- Hardware setup (unchanged from your version) ----------------------
 
 void motion_pin_config (void)
 {
- DDRB = DDRB | 0x0F;   //set direction of the PORTB3 to PORTB0 pins as output
- PORTB = PORTB & 0xF0; // set initial value of the PORTB3 to PORTB0 pins to logic 0
- DDRD = DDRD | 0x30;   //Setting PD4 and PD5 pins as output for PWM generation
- PORTD = PORTD | 0x30; //PD4 and PD5 pins are for velocity control using PWM
+ DDRB = DDRB | 0x0F;
+ PORTB = PORTB & 0xF0;
+ DDRD = DDRD | 0x30;
+ PORTD = PORTD | 0x30;
 }
 
-//Function used for setting motor's direction
 void motion_set (unsigned char Direction)
 {
  unsigned char PortBRestore = 0;
-
- Direction &= 0x0F; 			// removing upper nibbel as it is not needed
- PortBRestore = PORTB; 			// reading the PORTB's original status
- PortBRestore &= 0xF0; 			// setting lower direction nibbel to 0
- PortBRestore |= Direction; 	// adding lower nibbel for direction command and restoring the PORTB status
- PORTB = PortBRestore; 			// setting the command to the port
+ Direction &= 0x0F;
+ PortBRestore = PORTB;
+ PortBRestore &= 0xF0;
+ PortBRestore |= Direction;
+ PORTB = PortBRestore;
 }
 
-void forward (void)         //both wheels forward
-{
-  motion_set(0x06);
-}
+void forward (void)        { motion_set(0x06); }
+void back (void)           { motion_set(0x09); }
+void left (void)           { motion_set(0x05); }
+void right (void)          { motion_set(0x0A); }
+void soft_left (void)      { motion_set(0x04); }
+void soft_right (void)     { motion_set(0x02); }
+void soft_left_2 (void)    { motion_set(0x01); }
+void soft_right_2 (void)   { motion_set(0x08); }
+void hard_stop (void)      { motion_set(0x00); }
+void soft_stop (void)      { motion_set(0x0F); }
 
-void back (void)            //both wheels backward
-{
-  motion_set(0x09);
-}
-
-void left (void)            //Left wheel backward, Right wheel forward
-{
-  motion_set(0x05);
-}
-
-void right (void)           //Left wheel forward, Right wheel backward
-{   
-  motion_set(0x0A);
-}
-
-void soft_left (void)       //Left wheel stationary, Right wheel forward
-{
- motion_set(0x04);
-}
-
-void soft_right (void)      //Left wheel forward, Right wheel is stationary
-{ 
- motion_set(0x02);
-}
-
-void soft_left_2 (void)     //Left wheel backward, right wheel stationary
-{
- motion_set(0x01);
-}
-
-void soft_right_2 (void)    //Left wheel stationary, Right wheel backward
-{
- motion_set(0x08);
-}
-
-void hard_stop (void)       //hard stop(stop suddenly)
-{
-  motion_set(0x00);
-}
-
-void soft_stop (void)       //soft stop(stops slowly)
-{
-  motion_set(0x0F);
-}
-
-//Function to Initialize ADC
 void adc_init()
 {
  ADCSRA = 0x00;
- ADMUX = 0x20;		//Vref=5V external --- ADLAR=1 --- MUX4:0 = 0000
+ ADMUX = 0x20;
  ACSR = 0x80;
- ADCSRA = 0x86;		//ADEN=1 --- ADIE=1 --- ADPS2:0 = 1 1 0
+ ADCSRA = 0x86;
 }
-
 
 void init_devices (void)
 {
- cli(); //Clears the global interrupts
+ cli();
  port_init();
  adc_init();
- sei(); //Enables the global interrupts
+ sei();
 }
 
-
-//Function to configure LCD port
 void lcd_port_config (void)
 {
- DDRC = DDRC | 0xF7;    //all the LCD pin's direction set as output
- PORTC = PORTC & 0x80;  // all the LCD pins are set to logic 0 except PORTC 7
+ DDRC = DDRC | 0xF7;
+ PORTC = PORTC & 0x80;
 }
 
-//ADC pin configuration
 void adc_pin_config (void)
 {
- DDRA = 0x00;   //set PORTF direction as input
- PORTA = 0x00;  //set PORTF pins floating
+ DDRA = 0x00;
+ PORTA = 0x00;
 }
 
-//Function to Initialize PORTS
 void port_init()
 {
  lcd_port_config();
@@ -126,14 +114,10 @@ void port_init()
  motion_pin_config();
 }
 
-//TIMER1 initialize - prescale:64
-// WGM: 5) PWM 8bit fast, TOP=0x00FF
-// desired value: 450Hz
-// actual value: 450.000Hz (0.0%)
 void timer1_init(void)
 {
- TCCR1B = 0x00; //stop
- TCNT1H = 0xFF; //setup
+ TCCR1B = 0x00;
+ TCNT1H = 0xFF;
  TCNT1L = 0x01;
  OCR1AH = 0x00;
  OCR1AL = 0xFF;
@@ -142,148 +126,153 @@ void timer1_init(void)
  ICR1H  = 0x00;
  ICR1L  = 0xFF;
  TCCR1A = 0xA1;
- TCCR1B = 0x0D; //start Timer
+ TCCR1B = 0x0D;
 }
 
-//This Function accepts the Channel Number and returns the corresponding Analog Value
 unsigned char ADC_Conversion(unsigned char Ch)
 {
  unsigned char a;
  Ch = Ch & 0x07;
  ADMUX= 0x20| Ch;
- ADCSRA = ADCSRA | 0x40;	//Set start conversion bit
- while((ADCSRA&0x10)==0);	//Wait for ADC conversion to complete
+ ADCSRA = ADCSRA | 0x40;
+ while((ADCSRA&0x10)==0);
  a=ADCH;
- ADCSRA = ADCSRA|0x10;      //clear ADIF (ADC Interrupt Flag) by writing 1 to it
+ ADCSRA = ADCSRA|0x10;
  return a;
 }
 
-//Main Function
+void velocity_control(unsigned char left_speed, unsigned char right_speed)
+{
+ OCR1AL = left_speed;
+ OCR1BL = right_speed;
+}
+
+int cap_speed(int speed)
+{
+ if (speed > MAX_SPEED) return MAX_SPEED;
+ if (speed < MIN_SPEED) return MIN_SPEED;
+ return speed;
+}
+
+// ---- Per-sensor normalization -------------------------------------------
+// Maps a raw ADC reading onto a common 0..255 scale using THIS sensor's
+// measured min/max, so all three sensors become directly comparable
+// despite having different raw sensitivities.
+unsigned char normalize_sensor(unsigned char raw, unsigned char s_min, unsigned char s_max)
+{
+ if (s_max <= s_min) return raw;   // guards against unset/bad calibration data
+ long scaled = ((long)raw - s_min) * 255L / (long)(s_max - s_min);
+ if (scaled < 0)   scaled = 0;
+ if (scaled > 255) scaled = 255;
+ return (unsigned char)scaled;
+}
+
+// ---- Weighted-position error --------------------------------------------
+// Treats each (normalized) sensor value as a weight and computes a
+// centroid across the three sensor positions:
+//   ~ -255  -> line fully under the left sensor
+//   ~    0  -> line centered
+//   ~ +255  -> line fully under the right sensor
+float compute_position(unsigned char lv, unsigned char cv, unsigned char rv)
+{
+ unsigned int total = (unsigned int)lv + cv + rv;
+ if (total == 0) return prev_error;   // guarded by caller, kept as a safety net
+ long weighted = (long)lv * -255L + (long)rv * 255L;  // center contributes 0 weight
+ return (float)weighted / (float)total;
+}
+
+// ---- Main ---------------------------------------------------------------
+
 int main(void)
 {
-	int prev = 0;
+ int prev = 0;
  init_devices();
+ timer1_init();
 
  lcd_set_4bit();
  lcd_init();
 
-while(1)
-{
-	l=ADC_Conversion(3);
-	c=3*ADC_Conversion(4);
-	r=ADC_Conversion(5);
-	lcd_print(1, 1, l, 3);
-	lcd_print(1, 5, c, 3);
-	lcd_print(1, 9, r, 3);
-	lcd_print(1, 13, prev, 3);
-	_delay_ms(300);
-	
-	if(l>c && l>20){
-		if(c<20){
-			hard_stop();
-			soft_left();
-			_delay_ms(25);
-			l=ADC_Conversion(3);
-			c=3*ADC_Conversion(4);
-			r=ADC_Conversion(5);
-		}
-	}
-	else if(r>c && r>20){
-		if(c<20){
-			hard_stop();
-			soft_right();
-			_delay_ms(25);
-			l=ADC_Conversion(3);
-			c=3*ADC_Conversion(4);
-			r=ADC_Conversion(5);
-		}
-	}
-	else if(c > r && c > l && c>20){
-		forward();
-		prev=3;
-		_delay_ms(25);
-	}
-	else{
-		if(prev == 3 ||prev== 4){
-			if(c > r && c > l && c>15){
-				back();
-				_delay_ms(500);
-				prev = 4;
-			}
-		}
-		else{
-			if(prev==1){
-				right();
-				_delay_ms(50);
-				back();
-				_delay_ms(50);
-				prev=0;
-			}
-			else if(prev==2){
-				left();
-				_delay_ms(50);
-				back();
-				_delay_ms(50);
-				prev=0;
-			}
-			else{
-				soft_stop();
-			}
-		}
-	}
-}
+ while(1)
+ {
+  // Raw readings — shown on the LCD as-is so they're usable for calibration.
+  unsigned char l_raw = ADC_Conversion(3);
+  unsigned char c_raw = ADC_Conversion(4);
+  unsigned char r_raw = ADC_Conversion(5);
+  lcd_print(1, 1, l_raw, 3);
+  lcd_print(1, 5, c_raw, 3);
+  lcd_print(1, 9, r_raw, 3);
+  lcd_print(1, 13, prev, 3);
 
-/*
-while(1)
-{
-	forward();            //both wheels forward
-	_delay_ms(1000);
+  // Normalized readings — everything below this line uses these, not raw.
+  l = normalize_sensor(l_raw, L_MIN, L_MAX);
+  c = normalize_sensor(c_raw, C_MIN, C_MAX);
+  r = normalize_sensor(r_raw, R_MIN, R_MAX);
 
-	hard_stop();						
-	_delay_ms(300);
+  unsigned int total = (unsigned int)l + c + r;
 
-	back();               //both wheels backward						
-	_delay_ms(1000);
+  if (total < LINE_THRESH)
+  {
+   // Line fully lost: back off and swing toward the side we were last
+   // curving to, rather than a fixed direction.
+   hard_stop();
+   velocity_control(RECOVERY_SPEED, RECOVERY_SPEED);
+   if (prev_error > 0)      right();
+   else if (prev_error < 0) left();
+   _delay_ms(50);
+   back();
+   _delay_ms(50);
+   hard_stop();
 
-	hard_stop();						
-	_delay_ms(300);
+   // Recovery used a large, non-PID-loop delay — reset controller state
+   // so the next PID cycle doesn't see a bogus derivative ("derivative
+   // kick") from the time that passed.
+   integral = 0;
+   filtered_derivative = 0;
+   prev_error = 0;
+  }
+  else if (l > LINE_THRESH && c > LINE_THRESH && r > LINE_THRESH)
+  {
+   // All sensors on line (thick line / intersection) — go straight.
+   forward();
+   velocity_control(BASE_SPEED, BASE_SPEED);
+   integral = 0;
+   prev_error = 0;
+  }
+  else
+  {
+   error = compute_position(l, c, r);
 
-	left();               //Left wheel backward, Right wheel forward
-	_delay_ms(1000);
+   if (fabsf(error) > SHARP_TURN_ERR)
+   {
+    // Sharp corner: differential PID steering can't turn fast enough
+    // before the bot runs off the line, so pivot on the spot instead.
+    if (error > 0) right();
+    else           left();
+    velocity_control(PIVOT_SPEED, PIVOT_SPEED);
+    integral = 0;
+    filtered_derivative = 0;
+    prev_error = error;
+   }
+   else
+   {
+    integral += error;
+    if (integral > 200)  integral = 200;
+    if (integral < -200) integral = -200;
 
-	hard_stop();						
-	_delay_ms(300);
+    derivative = error - prev_error;
+    filtered_derivative = D_FILTER_ALPHA * derivative + (1.0f - D_FILTER_ALPHA) * filtered_derivative;
+    prev_error = error;
 
-	right();              //Left wheel forward, Right wheel backward
-	_delay_ms(1000);
+    pid_output = (KP * error) + (KI * integral) + (KD * filtered_derivative);
 
-	hard_stop();						
-	_delay_ms(300);
+    int left_speed  = cap_speed(BASE_SPEED - (int)pid_output);
+    int right_speed = cap_speed(BASE_SPEED + (int)pid_output);
 
-	soft_left();          //Left wheel stationary, Right wheel forward
-	_delay_ms(1000);
+    forward();
+    velocity_control((unsigned char)left_speed, (unsigned char)right_speed);
+   }
+  }
 
-	hard_stop();						
-	_delay_ms(300);
-
-	soft_right();         //Left wheel forward, Right wheel is stationary
-	_delay_ms(1000);
-
-	hard_stop();						
-	_delay_ms(300);
-
-	soft_left_2();        //Left wheel backward, right wheel stationary
-	_delay_ms(1000);
-
-	hard_stop();						
-	_delay_ms(300);
-
-	soft_right_2();       //Left wheel stationary, Right wheel backward
-	_delay_ms(1000);
-
-	hard_stop();						
-	_delay_ms(300);
-}
-*/
-
+  _delay_ms(10);
+ }
 }
